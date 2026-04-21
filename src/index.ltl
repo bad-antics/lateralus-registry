@@ -1,0 +1,117 @@
+// registry/src/index.ltl — Git-backed sparse package index.
+//
+// Every crate has a file at `<first-2-chars>/<next-2>/<crate-name>`
+// whose body is one JSON-per-line record per published version. The
+// client keeps a local clone and does incremental fetches via the
+// smart-HTTP protocol, mirroring cargo's design. For a name `foo`:
+//   fo/o/foo        -> one line per version (<=3 chars)
+//   fo/ob/foobar    -> same, ≥4 chars
+// Special-cased 1-char and 3-char paths match cargo exactly so tooling
+// can be shared.
+
+use fs::File
+use encoding::json
+use crypto::sha256
+use semver::Version
+
+pub struct IndexEntry {
+    pub name: String,
+    pub vers: Version,
+    pub deps: Vec<Dep>,
+    pub cksum: [u8; 32],
+    pub features: Vec<(String, Vec<String>)>,
+    pub yanked: bool,
+    pub links: Option<String>,
+}
+
+pub struct Dep {
+    pub name: String,
+    pub req:  String, // semver requirement string
+    pub features: Vec<String>,
+    pub optional: bool,
+    pub default_features: bool,
+    pub target: Option<String>,
+    pub kind: DepKind,
+    pub registry: Option<String>,
+    pub package: Option<String>, // rename
+}
+
+pub enum DepKind { Normal, Build, Dev }
+
+pub fn path_for(name: &str) -> String {
+    let n = name.to_ascii_lowercase()
+    match n.len() {
+        0 => panic!("empty crate name"),
+        1 => format!("1/{}", n),
+        2 => format!("2/{}", n),
+        3 => format!("3/{}/{}", &n[..1], n),
+        _ => format!("{}/{}/{}", &n[..2], &n[2..4], n),
+    }
+}
+
+pub fn load_entries(index_root: &str, name: &str) -> Result<Vec<IndexEntry>, Error> {
+    let p = format!("{}/{}", index_root, path_for(name))
+    let text = File::read_to_string(&p).map_err(|_| Error::NotFound(name.into()))?
+    let mut out = Vec::new()
+    for (ln, line) in text.lines().enumerate() {
+        if line.trim().is_empty() { continue }
+        let v: json::Value = json::from_str(line).map_err(|_| Error::BadEntry(ln + 1))?
+        out.push(parse_entry(&v).map_err(|e| Error::BadField(ln + 1, e))?)
+    }
+    Ok(out)
+}
+
+fn parse_entry(v: &json::Value) -> Result<IndexEntry, &'static str> {
+    let o = v.as_object().ok_or("not an object")?
+    let name  = o.get("name").and_then(|x| x.as_str()).ok_or("name")?.to_string()
+    let vers  = o.get("vers").and_then(|x| x.as_str()).ok_or("vers")?
+    let vers  = Version::parse(vers).map_err(|_| "bad semver")?
+    let cksum_hex = o.get("cksum").and_then(|x| x.as_str()).ok_or("cksum")?
+    let cksum = hex_decode_32(cksum_hex).ok_or("bad cksum hex")?
+    let yanked = o.get("yanked").and_then(|x| x.as_bool()).unwrap_or(false)
+    let links  = o.get("links").and_then(|x| x.as_str()).map(String::from)
+
+    let deps = o.get("deps").and_then(|x| x.as_array()).map(|arr| {
+        arr.iter().filter_map(|d| parse_dep(d).ok()).collect()
+    }).unwrap_or_default()
+
+    let features = o.get("features").and_then(|x| x.as_object()).map(|fo| {
+        fo.iter().map(|(k, vv)| (k.clone(),
+            vv.as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+              .unwrap_or_default()
+        )).collect()
+    }).unwrap_or_default()
+
+    Ok(IndexEntry { name, vers, deps, cksum, features, yanked, links })
+}
+
+fn parse_dep(v: &json::Value) -> Result<Dep, &'static str> {
+    let o = v.as_object().ok_or("not object")?
+    let name = o.get("name").and_then(|x| x.as_str()).ok_or("dep.name")?.to_string()
+    let req  = o.get("req").and_then(|x| x.as_str()).ok_or("dep.req")?.to_string()
+    let features = o.get("features").and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+    let optional = o.get("optional").and_then(|x| x.as_bool()).unwrap_or(false)
+    let default_features = o.get("default_features").and_then(|x| x.as_bool()).unwrap_or(true)
+    let target = o.get("target").and_then(|x| x.as_str()).map(String::from)
+    let registry = o.get("registry").and_then(|x| x.as_str()).map(String::from)
+    let package  = o.get("package").and_then(|x| x.as_str()).map(String::from)
+    let kind = match o.get("kind").and_then(|x| x.as_str()) {
+        Some("dev")   => DepKind::Dev,
+        Some("build") => DepKind::Build,
+        _             => DepKind::Normal,
+    }
+    Ok(Dep { name, req, features, optional, default_features, target, kind, registry, package })
+}
+
+fn hex_decode_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 { return None }
+    let mut out = [0u8; 32]
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&s[i*2..i*2+2], 16).ok()?
+    }
+    Some(out)
+}
+
+pub enum Error { NotFound(String), BadEntry(usize), BadField(usize, &'static str) }
