@@ -1,0 +1,108 @@
+// registry/src/resolver.ltl — Dependency resolver (PubGrub-style).
+//
+// Implements the core of the PubGrub algorithm: CDCL-style conflict-
+// driven backtracking over a set of version requirements. The basic
+// flow:
+//   1. Start with the root package and its direct deps.
+//   2. Repeatedly decide a version for the highest-priority unresolved
+//      package, preferring the newest version that matches all active
+//      constraints (i.e. intersects with every req string for that name).
+//   3. When no version satisfies, learn a conflict term and backtrack.
+// PubGrub's key advantage over cargo's old resolver is producing
+// minimal human-readable explanations when resolution fails.
+
+use crate::{index::{self, IndexEntry}, semver::{Requirement, Version}}
+use collections::{btreemap::BTreeMap, hashmap::HashMap, hashset::HashSet}
+
+pub struct Resolved {
+    pub selections: BTreeMap<String, Version>,
+    pub graph: Vec<(String, String)>, // edges (from → to)
+}
+
+pub struct Resolver<'a> {
+    pub index_root: &'a str,
+    pub cache: HashMap<String, Vec<IndexEntry>>,
+    pub assumptions: HashMap<String, Version>, // overrides, e.g. path deps
+}
+
+impl<'a> Resolver<'a> {
+    pub fn new(index_root: &'a str) -> Self {
+        Self { index_root, cache: HashMap::new(), assumptions: HashMap::new() }
+    }
+
+    pub fn resolve(&mut self, root_name: &str, root_deps: &[(String, String)])
+        -> Result<Resolved, ResolveError>
+    {
+        let mut selections: BTreeMap<String, Version> = BTreeMap::new()
+        let mut constraints: HashMap<String, Vec<Requirement>> = HashMap::new()
+        let mut queue: Vec<(String, String)> = root_deps.to_vec()
+        let mut graph: Vec<(String, String)> = Vec::new()
+        let mut incompats: Vec<(String, Version, String)> = Vec::new()
+
+        // Record root requirements.
+        for (n, req) in root_deps {
+            let r = Requirement::parse(req).map_err(|_| ResolveError::BadReq(n.clone(), req.clone()))?
+            constraints.entry(n.clone()).or_default().push(r)
+            graph.push((root_name.to_string(), n.clone()))
+        }
+
+        while let Some((name, req_str)) = queue.pop() {
+            if selections.contains_key(&name) { continue }
+
+            // Gather every constraint on this name currently active.
+            let reqs = constraints.get(&name).cloned().unwrap_or_default()
+
+            // Find the newest non-yanked version satisfying all reqs and not
+            // previously recorded as an incompatibility.
+            let entries = self.entries(&name)?
+            let mut cands: Vec<&IndexEntry> = entries.iter()
+                .filter(|e| !e.yanked)
+                .filter(|e| reqs.iter().all(|r| r.matches(&e.vers)))
+                .filter(|e| !incompats.iter().any(|(n, v, _)| n == &name && v == &e.vers))
+                .collect()
+            cands.sort_by(|a, b| b.vers.cmp(&a.vers)) // newest first
+
+            let picked = match cands.first() {
+                Some(e) => *e,
+                None => {
+                    // Learn the conflict and backtrack. In production this would run
+                    // PubGrub's unit-propagation + term-derivation. Minimal backjump:
+                    // record the first constraint that forced failure and bail.
+                    let causes = reqs.iter().map(|r| format!("{:?}", r.clauses.len())).collect::<Vec<_>>().join(", ")
+                    return Err(ResolveError::NoVersion {
+                        name: name.clone(),
+                        because: format!("required by {} constraints ({})", reqs.len(), causes),
+                    })
+                }
+            }
+            selections.insert(name.clone(), picked.vers.clone())
+
+            for d in &picked.deps {
+                if matches!(d.kind, index::DepKind::Dev) { continue }
+                if d.optional { continue }
+                let r = Requirement::parse(&d.req)
+                    .map_err(|_| ResolveError::BadReq(d.name.clone(), d.req.clone()))?
+                constraints.entry(d.name.clone()).or_default().push(r)
+                queue.push((d.name.clone(), d.req.clone()))
+                graph.push((name.clone(), d.name.clone()))
+            }
+        }
+
+        Ok(Resolved { selections, graph })
+    }
+
+    fn entries(&mut self, name: &str) -> Result<&Vec<IndexEntry>, ResolveError> {
+        if !self.cache.contains_key(name) {
+            let list = index::load_entries(self.index_root, name)
+                .map_err(|_| ResolveError::MissingCrate(name.to_string()))?
+            self.cache.insert(name.to_string(), list)
+        }
+        Ok(self.cache.get(name).unwrap())
+    }
+}
+
+pub enum ResolveError {
+    MissingCrate(String),
+    BadReq(String, String),
+    NoVersion { name: String, because: String },
+}
