@@ -1,0 +1,149 @@
+// registry/src/semver.ltl — Full semver 2.0 + cargo-style requirements.
+//
+// Versions compare per the semver-2.0 precedence rules, including
+// pre-release ordering: "1.0.0-alpha.1 < 1.0.0-alpha.2 < 1.0.0-beta <
+// 1.0.0-beta.2 < 1.0.0-rc.1 < 1.0.0". Numeric pre-release identifiers
+// compare numerically; alphanumeric compare ASCII-lex; numeric always
+// ranks below alphanumeric. Build metadata is ignored for ordering.
+//
+// Requirement strings support cargo flavors:
+//   "1.2.3"      ~> caret: ^1.2.3 — compatible with 1.2.3 (< 2.0.0)
+//   "^1.2.3"     ~> caret
+//   "~1.2.3"     ~> tilde: >=1.2.3, <1.3.0
+//   "=1.2.3"     ~> exact
+//   "*"          ~> any stable version
+//   ">=1.2, <2"  ~> comma-joined AND expression
+
+pub struct Version {
+    pub major: u64, pub minor: u64, pub patch: u64,
+    pub pre: Vec<PreId>,
+    pub build: String,
+}
+
+pub enum PreId { Num(u64), Str(String) }
+
+impl Version {
+    pub fn parse(s: &str) -> Result<Self, &'static str> {
+        let (core, rest) = split_once_any(s, ['-', '+'])
+        let (pre_str, build) = if rest.starts_with('-') {
+            let tail = &rest[1..]
+            if let Some(i) = tail.find('+') { (&tail[..i], tail[i+1..].to_string()) }
+            else { (tail, String::new()) }
+        } else if rest.starts_with('+') {
+            ("", rest[1..].to_string())
+        } else { ("", String::new()) }
+
+        let mut parts = core.split('.')
+        let major = parts.next().ok_or("major")?.parse().map_err(|_| "major")?
+        let minor = parts.next().ok_or("minor")?.parse().map_err(|_| "minor")?
+        let patch = parts.next().ok_or("patch")?.parse().map_err(|_| "patch")?
+        if parts.next().is_some() { return Err("extra core field") }
+
+        let pre: Vec<PreId> = if pre_str.is_empty() { Vec::new() } else {
+            pre_str.split('.').map(|tok|
+                if tok.chars().all(|c| c.is_ascii_digit()) && !(tok.len() > 1 && tok.starts_with('0')) {
+                    PreId::Num(tok.parse().unwrap())
+                } else { PreId::Str(tok.to_string()) }
+            ).collect()
+        }
+        Ok(Version { major, minor, patch, pre, build })
+    }
+
+    pub fn cmp(&self, other: &Version) -> std::cmp::Ordering {
+        use std::cmp::Ordering::*
+        let c = (self.major, self.minor, self.patch).cmp(&(other.major, other.minor, other.patch))
+        if c != Equal { return c }
+        match (self.pre.is_empty(), other.pre.is_empty()) {
+            (true, true)   => Equal,
+            (true, false)  => Greater, // 1.0.0 > 1.0.0-alpha
+            (false, true)  => Less,
+            (false, false) => cmp_pre(&self.pre, &other.pre),
+        }
+    }
+}
+
+fn cmp_pre(a: &[PreId], b: &[PreId]) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*
+    for (x, y) in a.iter().zip(b.iter()) {
+        let c = match (x, y) {
+            (PreId::Num(n), PreId::Num(m))    => n.cmp(m),
+            (PreId::Num(_), PreId::Str(_))    => Less,
+            (PreId::Str(_), PreId::Num(_))    => Greater,
+            (PreId::Str(s), PreId::Str(t))    => s.cmp(t),
+        }
+        if c != Equal { return c }
+    }
+    a.len().cmp(&b.len())
+}
+
+pub struct Requirement { pub clauses: Vec<Clause> }
+
+pub struct Clause { pub op: Op, pub v: Version }
+
+pub enum Op { Exact, Gt, Lt, Gte, Lte, Caret, Tilde }
+
+impl Requirement {
+    pub fn parse(s: &str) -> Result<Self, &'static str> {
+        if s.trim() == "*" { return Ok(Requirement { clauses: vec![] }) }
+        let mut clauses = Vec::new()
+        for part in s.split(',').map(str::trim) {
+            clauses.push(parse_clause(part)?)
+        }
+        Ok(Requirement { clauses })
+    }
+
+    pub fn matches(&self, v: &Version) -> bool {
+        if !self.clauses.is_empty() && self.clauses.iter().all(|c| c.op != Op::Caret && c.op != Op::Tilde) {
+            // Stable-only by default: skip pre-release unless the requirement itself
+            // mentions a pre-release in any clause.
+            if !v.pre.is_empty() && !self.clauses.iter().any(|c| !c.v.pre.is_empty()) {
+                return false
+            }
+        }
+        self.clauses.iter().all(|c| c.matches(v))
+    }
+}
+
+fn parse_clause(part: &str) -> Result<Clause, &'static str> {
+    let (op, rest) = if let Some(r) = part.strip_prefix(">=") { (Op::Gte, r.trim()) }
+        else if let Some(r) = part.strip_prefix("<=") { (Op::Lte, r.trim()) }
+        else if let Some(r) = part.strip_prefix(">")  { (Op::Gt,  r.trim()) }
+        else if let Some(r) = part.strip_prefix("<")  { (Op::Lt,  r.trim()) }
+        else if let Some(r) = part.strip_prefix("=")  { (Op::Exact, r.trim()) }
+        else if let Some(r) = part.strip_prefix("^")  { (Op::Caret, r.trim()) }
+        else if let Some(r) = part.strip_prefix("~")  { (Op::Tilde, r.trim()) }
+        else { (Op::Caret, part) }
+    Ok(Clause { op, v: Version::parse(rest)? })
+}
+
+impl Clause {
+    pub fn matches(&self, v: &Version) -> bool {
+        use std::cmp::Ordering::*
+        let c = v.cmp(&self.v)
+        match self.op {
+            Op::Exact => c == Equal,
+            Op::Gt    => c == Greater,
+            Op::Gte   => c != Less,
+            Op::Lt    => c == Less,
+            Op::Lte   => c != Greater,
+            Op::Caret => {
+                // Compatible-update per cargo: same leftmost non-zero field.
+                if c == Less { return false }
+                if self.v.major > 0 { v.major == self.v.major }
+                else if self.v.minor > 0 { v.major == 0 && v.minor == self.v.minor }
+                else { v.major == 0 && v.minor == 0 && v.patch == self.v.patch }
+            }
+            Op::Tilde => {
+                if c == Less { return false }
+                v.major == self.v.major && v.minor == self.v.minor
+            }
+        }
+    }
+}
+
+fn split_once_any(s: &str, set: [char; 2]) -> (&str, &str) {
+    match s.find(|c: char| set.contains(&c)) {
+        Some(i) => (&s[..i], &s[i..]),
+        None    => (s, ""),
+    }
+}
