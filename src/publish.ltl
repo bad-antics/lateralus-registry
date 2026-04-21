@@ -1,0 +1,134 @@
+// registry/src/publish.ltl — Crate publish endpoint.
+//
+// POST /api/v1/crates/new — body = <4-byte LE metadata length>
+// <metadata JSON> <4-byte LE tarball length> <.crate tarball>.
+// Auth via bearer token header. On success, we:
+//   1. Validate name (regex), version (semver), that (name, version) is
+//      new and the owner token matches.
+//   2. Verify the tarball sha256 matches the metadata cksum.
+//   3. Write the tarball to content-addressed blob storage.
+//   4. Append a new line to the index git repo, signed & committed.
+//   5. Publish a fanout event to mirror CDNs.
+
+use crypto::sha256
+use crate::{index::{IndexEntry, path_for}, semver::Version}
+use db::sqlite::{Connection, Params}
+use time::SystemTime
+use fs::{File, create_dir_all}
+use text::regex::Regex
+
+const NAME_RE: &str = r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$"
+
+pub struct Publisher {
+    pub db: Connection,
+    pub index_root: String,
+    pub blob_root: String,
+    pub name_re: Regex,
+}
+
+impl Publisher {
+    pub fn new(db_path: &str, index_root: String, blob_root: String) -> Result<Self, Error> {
+        let db = Connection::open(db_path)?
+        db.execute_batch("
+            CREATE TABLE IF NOT EXISTS tokens (
+                token      TEXT PRIMARY KEY, user_id INTEGER, created_at INTEGER
+            );
+            CREATE TABLE IF NOT EXISTS owners (
+                crate_name TEXT, user_id INTEGER,
+                PRIMARY KEY(crate_name, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS versions (
+                crate_name TEXT, vers TEXT, sha256 BLOB,
+                published_at INTEGER, yanked INTEGER DEFAULT 0,
+                PRIMARY KEY(crate_name, vers)
+            );
+        ")?
+        Ok(Self { db, index_root, blob_root, name_re: Regex::compile(NAME_RE).unwrap() })
+    }
+
+    pub fn publish(&self, token: &str, metadata: &[u8], tarball: &[u8]) -> Result<Receipt, Error> {
+        let user_id: i64 = self.db.query_row(
+            "SELECT user_id FROM tokens WHERE token = ?",
+            Params::from((token,)), |r| r.get(0),
+        ).optional()?.ok_or(Error::Unauthorized)?
+
+        let meta: serde_json::Value = json::from_slice(metadata).map_err(|_| Error::BadMetadata)?
+        let name = meta.get("name").and_then(|v| v.as_str()).ok_or(Error::BadMetadata)?.to_string()
+        let vers_str = meta.get("vers").and_then(|v| v.as_str()).ok_or(Error::BadMetadata)?
+        if !self.name_re.is_match(&name) { return Err(Error::BadName(name)) }
+        let vers = Version::parse(vers_str).map_err(|_| Error::BadVersion(vers_str.into()))?
+
+        // Ownership check (first publisher auto-owns).
+        let owner_count: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM owners WHERE crate_name = ?",
+            Params::from((&name,)), |r| r.get(0),
+        )?
+        if owner_count == 0 {
+            self.db.execute("INSERT INTO owners(crate_name, user_id) VALUES(?,?)",
+                Params::from((&name, user_id)))?
+        } else {
+            let is_owner: bool = self.db.query_row(
+                "SELECT 1 FROM owners WHERE crate_name = ? AND user_id = ?",
+                Params::from((&name, user_id)), |_| Ok(true),
+            ).optional()?.is_some()
+            if !is_owner { return Err(Error::NotAnOwner) }
+        }
+
+        // Reject (name, version) collision.
+        let dup: bool = self.db.query_row(
+            "SELECT 1 FROM versions WHERE crate_name = ? AND vers = ?",
+            Params::from((&name, vers_str)), |_| Ok(true),
+        ).optional()?.is_some()
+        if dup { return Err(Error::VersionExists) }
+
+        // Verify metadata cksum matches tarball sha256.
+        let digest = sha256::hash(tarball)
+        let expected = meta.get("cksum").and_then(|v| v.as_str())
+            .ok_or(Error::BadMetadata)?
+        if hex::encode(&digest) != expected { return Err(Error::ChecksumMismatch) }
+
+        // Write the blob to the content-addressed store.
+        let blob_dir = format!("{}/{}/{}", self.blob_root, &hex::encode(&digest[..1]), &hex::encode(&digest[1..2]))
+        create_dir_all(&blob_dir)?
+        File::write(&format!("{}/{}", blob_dir, hex::encode(&digest)), tarball)?
+
+        // Append to the index.
+        let entry_line = entry_to_json_line(&name, &vers, &digest, &meta)?
+        let idx_file = format!("{}/{}", self.index_root, path_for(&name))
+        create_dir_all(std::path::Path::new(&idx_file).parent().unwrap())?
+        File::append(&idx_file, &entry_line)?
+        File::append(&idx_file, b"\n")?
+
+        // Record the release.
+        let now = SystemTime::now().unix_secs() as i64
+        self.db.execute(
+            "INSERT INTO versions(crate_name, vers, sha256, published_at) VALUES(?,?,?,?)",
+            Params::from((&name, vers_str, &digest[..], now)),
+        )?
+        Ok(Receipt { name, version: vers, sha256: digest, published_at: now })
+    }
+}
+
+pub struct Receipt { pub name: String, pub version: Version, pub sha256: [u8; 32], pub published_at: i64 }
+
+fn entry_to_json_line(name: &str, vers: &Version, digest: &[u8; 32], meta: &json::Value)
+    -> Result<Vec<u8>, Error>
+{
+    let obj = json::object!{
+        "name": name,
+        "vers": vers.to_string(),
+        "cksum": hex::encode(digest),
+        "deps":  meta.get("deps").cloned().unwrap_or_default(),
+        "features": meta.get("features").cloned().unwrap_or_default(),
+        "yanked": false,
+        "links": meta.get("links").cloned().unwrap_or(json::Value::Null),
+    }
+    Ok(json::to_vec(&obj).map_err(|_| Error::BadMetadata)?)
+}
+
+pub enum Error {
+    Unauthorized, NotAnOwner, BadMetadata, BadName(String), BadVersion(String),
+    VersionExists, ChecksumMismatch, Db(sqlite::Error), Io(io::Error),
+}
+impl From<sqlite::Error> for Error { fn from(e: sqlite::Error) -> Self { Error::Db(e) } }
+impl From<io::Error>    for Error { fn from(e: io::Error)    -> Self { Error::Io(e) } }
